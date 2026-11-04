@@ -69,7 +69,7 @@ tools = [
 
 
 # --- Logging Function ---
-
+# TODO fix logs (specification in exercise 1 slides)
 def write_log(run_id: str, prompt: str, tool_calls: list, final_response: str):
     """
     Writes execution details into a JSONL log file under the logs/ directory.
