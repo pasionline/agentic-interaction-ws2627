@@ -8,39 +8,38 @@ import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# 1. Environment-Variablen laden
+# 1. Load configuration (environment variables take precedence over .env)
 load_dotenv(override=False)
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 MODEL = os.getenv("MODEL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATA_BASE_URL = os.getenv("DATA_BASE_URL")
+MAX_STEPS = int(os.getenv("MAX_STEPS", "10"))
 
-# Abbruch bei fehlender Konfiguration
 if not all([OPENAI_BASE_URL, MODEL, OPENAI_API_KEY, DATA_BASE_URL]):
-    missing = [k for k, v in {
-        "OPENAI_BASE_URL": OPENAI_BASE_URL,
-        "MODEL": MODEL,
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "DATA_BASE_URL": DATA_BASE_URL
-    }.items() if not v]
+    missing = [
+        k for k, v in {
+            "OPENAI_BASE_URL": OPENAI_BASE_URL,
+            "MODEL": MODEL,
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+            "DATA_BASE_URL": DATA_BASE_URL,
+        }.items() if not v
+    ]
     print(f"Error: Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
     sys.exit(1)
 
 
-# 2. Spezifikationskonformes Logging
+# 2. JSONL Logging
 def log_event(
         run_id: str,
         event: str,
         duration_ms: float,
         ok: bool = True,
         tool: str | None = None,
-        args: dict | None = None
+        args: dict | None = None,
 ):
-    """
-    Schreibt ein strukturiertes Event gemäß Spezifikation in logs/run_<run_id>.jsonl
-    Felder: ts, run_id, event, tool, args, ok, model, duration_ms
-    """
+    """Appends a structured JSONL event to logs/run_<run_id>.jsonl."""
     os.makedirs("logs", exist_ok=True)
     log_filename = os.path.join("logs", f"run_{run_id}.jsonl")
 
@@ -52,58 +51,54 @@ def log_event(
         "args": args if args is not None else {},
         "ok": ok,
         "model": MODEL,
-        "duration_ms": round(duration_ms, 2)
+        "duration_ms": round(duration_ms, 2),
     }
 
     with open(log_filename, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-# 3. Das Tool: Liest Kalendertage vom Mock-Server
-def get_calendar_events(date: str) -> tuple[str, bool, float]:
+# 3. Tool Implementation & Registry
+def get_calendar_events(date: str) -> tuple[str, bool]:
     """
-    Ruft Kalenderdaten unter {DATA_BASE_URL}/calendar/{date}.json ab.
-    Bei HTTP 404 wird kein Fehler geworfen, sondern ein leeres Ergebnis gemeldet.
-    Rückgabe: (response_text, ok_status, duration_ms)
+    Fetches calendar appointments for a given YYYY-MM-DD date.
+    Returns (json_string_payload, ok_flag).
     """
-    t0 = time.perf_counter()
-    url = f"{DATA_BASE_URL.rstrip('/')}/calendar/{date}.json"
+    if not date or not isinstance(date, str):
+        return json.dumps({"error": "Invalid or missing 'date' parameter. Expected YYYY-MM-DD."}), False
 
+    url = f"{DATA_BASE_URL.rstrip('/')}/calendar/{date}.json"
     try:
         response = requests.get(url, timeout=10)
-        duration_ms = (time.perf_counter() - t0) * 1000
-
         if response.status_code == 200:
-            return response.text, True, duration_ms
+            return response.text, True
         elif response.status_code == 404:
-            # HTTP 404 bedeutet laut Spezifikation: Keine Daten für diesen Tag
-            no_data_payload = json.dumps({
-                "events": [],
-                "message": f"No appointments found for date {date}."
-            })
-            return no_data_payload, True, duration_ms
+            # 404 means no appointments exist for that date; treat as valid empty response
+            return json.dumps({"events": [], "message": f"No data/appointments found for {date}."}), True
         else:
-            err_msg = json.dumps({"error": f"HTTP {response.status_code} while fetching calendar data"})
-            return err_msg, False, duration_ms
-
+            return json.dumps({"error": f"HTTP {response.status_code} when fetching {date}."}), False
     except Exception as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        return json.dumps({"error": str(e)}), False, duration_ms
+        return json.dumps({"error": f"Request failed for {date}: {str(e)}"}), False
 
 
-# Definition des Tool-Schemas für die OpenAI API
-tools = [
+# Registry makes adding new tools next week straightforward
+TOOL_REGISTRY = {
+    "get_calendar_events": get_calendar_events,
+}
+
+# Keep schema concise to conserve free-tier TPM (8,000 tokens/min)
+TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
             "name": "get_calendar_events",
-            "description": "Fetch calendar appointments for a specific day given in YYYY-MM-DD format.",
+            "description": "Get calendar appointments for a specific day (YYYY-MM-DD).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "date": {
                         "type": "string",
-                        "description": "The target date in YYYY-MM-DD format (e.g., '2026-10-29').",
+                        "description": "Date in YYYY-MM-DD format (e.g. '2026-10-29').",
                     }
                 },
                 "required": ["date"],
@@ -113,126 +108,172 @@ tools = [
 ]
 
 
-# 4. Agent Lifecycle / Main Loop
+# 4. Agent Loop
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python -m agent \"<question>\"", file=sys.stderr)
+        print('Usage: python -m agent "<question>"', file=sys.stderr)
         sys.exit(1)
 
     prompt = sys.argv[1]
     run_id = str(uuid.uuid4())
 
-    # Event 1: user_task
     log_event(
         run_id=run_id,
         event="user_task",
         duration_ms=0.0,
         ok=True,
-        tool=None,
-        args={"prompt": prompt}
+        args={"prompt": prompt},
     )
 
-    client = OpenAI(
-        base_url=OPENAI_BASE_URL,
-        api_key=OPENAI_API_KEY,
-    )
+    client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
-    messages = [{"role": "user", "content": prompt}]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful calendar assistant. Use the available tools to look up dates "
+                "needed to answer the user's question. Call tools as many times as needed, "
+                "then provide a concise final answer."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    step = 0
 
     try:
-        # Erster Modellaufruf (Model -> Tool)
-        t0_llm1 = time.perf_counter()
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-        )
-        llm1_duration = (time.perf_counter() - t0_llm1) * 1000
-        response_message = response.choices[0].message
+        while step < MAX_STEPS:
+            step += 1
 
-        # Wenn das Modell die Benutzung des Tools entscheidet
-        if response_message.tool_calls:
-            messages.append(response_message)
+            # One step = one model call
+            t0_llm = time.perf_counter()
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS_SCHEMA,
+                tool_choice="auto",
+            )
+            llm_duration = (time.perf_counter() - t0_llm) * 1000
+            response_message = response.choices[0].message
 
-            for tool_call in response_message.tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
+            # Case A: Model requested one or more tool calls
+            if response_message.tool_calls:
+                # Append clean assistant message with tool_calls to conversation history
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": response_message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in response_message.tool_calls
+                    ],
+                }
+                messages.append(assistant_msg)
 
-                # Event 2: tool_call
-                log_event(
-                    run_id=run_id,
-                    event="tool_call",
-                    duration_ms=llm1_duration,
-                    ok=True,
-                    tool=function_name,
-                    args=function_args
-                )
+                for tool_call in response_message.tool_calls:
+                    fn_name = tool_call.function.name
+                    raw_args = tool_call.function.arguments
 
-                if function_name == "get_calendar_events":
-                    date_arg = function_args.get("date")
-                    tool_output, ok_status, tool_duration = get_calendar_events(date=date_arg)
-
-                    # Event 3: tool_result
+                    # Parse arguments safely without aborting the run on malformed JSON
                     try:
-                        parsed_output = json.loads(tool_output)
+                        fn_args = json.loads(raw_args) if raw_args else {}
+                        args_valid = True
+                    except json.JSONDecodeError as e:
+                        fn_args = {"raw_arguments": raw_args}
+                        args_valid = False
+                        parse_error = f"Invalid JSON arguments: {str(e)}"
+
+                    log_event(
+                        run_id=run_id,
+                        event="tool_call",
+                        duration_ms=llm_duration,
+                        ok=args_valid,
+                        tool=fn_name,
+                        args=fn_args,
+                    )
+
+                    # Execute tool (errors here are caught and returned to the model)
+                    t0_tool = time.perf_counter()
+                    if not args_valid:
+                        tool_output = json.dumps({"error": parse_error})
+                        tool_ok = False
+                    elif fn_name not in TOOL_REGISTRY:
+                        tool_output = json.dumps({"error": f"Unknown tool '{fn_name}'."})
+                        tool_ok = False
+                    else:
+                        try:
+                            tool_output, tool_ok = TOOL_REGISTRY[fn_name](**fn_args)
+                        except TypeError as e:
+                            tool_output = json.dumps({"error": f"Argument mismatch for '{fn_name}': {str(e)}"})
+                            tool_ok = False
+                        except Exception as e:
+                            tool_output = json.dumps({"error": f"Tool execution error: {str(e)}"})
+                            tool_ok = False
+
+                    tool_duration = (time.perf_counter() - t0_tool) * 1000
+
+                    try:
+                        parsed_result = json.loads(tool_output)
                     except Exception:
-                        parsed_output = tool_output
+                        parsed_result = tool_output
 
                     log_event(
                         run_id=run_id,
                         event="tool_result",
                         duration_ms=tool_duration,
-                        ok=ok_status,
-                        tool=function_name,
-                        args={"date": date_arg, "result": parsed_output}
+                        ok=tool_ok,
+                        tool=fn_name,
+                        args={"input": fn_args, "output": parsed_result},
                     )
 
-                    # Antwort des Tools als Rolle 'tool' an den Verlauf anfügen
+                    # Feed tool output (even if ok=False) back to the model so it can recover
                     messages.append({
                         "tool_call_id": tool_call.id,
                         "role": "tool",
-                        "name": function_name,
+                        "name": fn_name,
                         "content": tool_output,
                     })
 
-            # Zweiter Modellaufruf (Tool -> Model) zur Generierung der Antwort
-            t0_llm2 = time.perf_counter()
-            second_response = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-            )
-            llm2_duration = (time.perf_counter() - t0_llm2) * 1000
-            final_answer = second_response.choices[0].message.content
-        else:
-            final_answer = response_message.content
-            llm2_duration = llm1_duration
+            # Case B: No tool calls -> Model decided it is done
+            else:
+                final_answer = response_message.content or ""
+                log_event(
+                    run_id=run_id,
+                    event="final",
+                    duration_ms=llm_duration,
+                    ok=True,
+                    args={"answer": final_answer, "steps": step},
+                )
+                print(final_answer)
+                sys.exit(0)
 
-        # Event 4: final
-        log_event(
-            run_id=run_id,
-            event="final",
-            duration_ms=llm2_duration,
-            ok=True,
-            tool=None,
-            args={"answer": final_answer}
-        )
-
-        # Ausgabe auf stdout & erfolgreicher Exit Code 0
-        print(final_answer)
-        sys.exit(0)
-
-    except Exception as err:
-        # Event 5: error (bei unerwarteten Ausnahmen)
+        # If loop exits because step == MAX_STEPS, end as an ERROR
+        err_msg = f"Agent exceeded maximum step limit ({MAX_STEPS}) without finishing."
         log_event(
             run_id=run_id,
             event="error",
             duration_ms=0.0,
             ok=False,
-            tool=None,
-            args={"error": str(err)}
+            args={"error": err_msg, "steps": step},
         )
-        print(f"Error: {err}", file=sys.stderr)
+        print(f"Error: {err_msg}", file=sys.stderr)
+        sys.exit(1)
+
+    except Exception as fatal_err:
+        log_event(
+            run_id=run_id,
+            event="error",
+            duration_ms=0.0,
+            ok=False,
+            args={"error": str(fatal_err), "steps": step},
+        )
+        print(f"Error: {fatal_err}", file=sys.stderr)
         sys.exit(1)
 
 
