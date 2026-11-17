@@ -131,9 +131,11 @@ def main():
         {
             "role": "system",
             "content": (
-                "You are a helpful calendar assistant. Use the available tools to look up dates "
-                "needed to answer the user's question. Call tools as many times as needed, "
-                "then provide a concise final answer."
+                "You are a precise calendar assistant. "
+                "Use the get_calendar_events tool (date format: YYYY-MM-DD) to check all dates required by the user's request. "
+                "For multi-day questions, call the tool as many times as needed until you have checked every relevant date. "
+                "If a tool call returns no data or an error for one date, do not stop—continue checking the remaining dates and mention the missing data in your answer. "
+                "Once you have all required information, stop calling tools and answer concisely in the user's language."
             ),
         },
         {"role": "user", "content": prompt},
