@@ -4,9 +4,9 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-import requests
 from dotenv import load_dotenv
 from openai import OpenAI
+from agent.tool_caller import TOOLS_SCHEMA, execute_tool
 
 # 1. Load configuration (environment variables take precedence over .env)
 load_dotenv(override=False)
@@ -29,6 +29,17 @@ if not all([OPENAI_BASE_URL, MODEL, OPENAI_API_KEY, DATA_BASE_URL]):
     print(f"Error: Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
     sys.exit(1)
 
+def get_system_prompt() -> str:
+    today = datetime.now().strftime("%A, %Y-%m-%d")
+    return (
+        f"Today's date is {today}. Always calculate relative dates ('today', 'tomorrow', 'yesterday') strictly from {today}. "
+        "You are a precise assistant with tools for calendar, weather, train connections, and user context. "
+        "ONLY call tools that are strictly necessary to answer what the user explicitly asked for—never fetch weather or calendar data unless requested. "
+        "If the user asks for train connections without naming a departure city, call get_user_context first to get their home city. "
+        "Use lowercase ASCII slugs for German cities (e.g. 'ulm', 'muenchen') and YYYY-MM-DD for dates. "
+        "CRITICAL: Never invent or guess data. If a tool returns no data (404), state clearly that no data is available. "
+        "Stop calling tools as soon as you have the requested facts and answer concisely in the user's language."
+    )
 
 # 2. JSONL Logging
 def log_event(
@@ -58,57 +69,7 @@ def log_event(
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-# 3. Tool Implementation & Registry
-def get_calendar_events(date: str) -> tuple[str, bool]:
-    """
-    Fetches calendar appointments for a given YYYY-MM-DD date.
-    Returns (json_string_payload, ok_flag).
-    """
-    if not date or not isinstance(date, str):
-        return json.dumps({"error": "Invalid or missing 'date' parameter. Expected YYYY-MM-DD."}), False
-
-    url = f"{DATA_BASE_URL.rstrip('/')}/calendar/{date}.json"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            return response.text, True
-        elif response.status_code == 404:
-            # 404 means no appointments exist for that date; treat as valid empty response
-            return json.dumps({"events": [], "message": f"No data/appointments found for {date}."}), True
-        else:
-            return json.dumps({"error": f"HTTP {response.status_code} when fetching {date}."}), False
-    except Exception as e:
-        return json.dumps({"error": f"Request failed for {date}: {str(e)}"}), False
-
-
-# Registry makes adding new tools next week straightforward
-TOOL_REGISTRY = {
-    "get_calendar_events": get_calendar_events,
-}
-
-# Keep schema concise to conserve free-tier TPM (8,000 tokens/min)
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_calendar_events",
-            "description": "Get calendar appointments for a specific day (YYYY-MM-DD).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "Date in YYYY-MM-DD format (e.g. '2026-10-29').",
-                    }
-                },
-                "required": ["date"],
-            },
-        },
-    }
-]
-
-
-# 4. Agent Loop
+# 3. Agent Loop
 def main():
     if len(sys.argv) < 2:
         print('Usage: python -m agent "<question>"', file=sys.stderr)
@@ -128,16 +89,7 @@ def main():
     client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a precise calendar assistant. "
-                "Use the get_calendar_events tool (date format: YYYY-MM-DD) to check all dates required by the user's request. "
-                "For multi-day questions, call the tool as many times as needed until you have checked every relevant date. "
-                "If a tool call returns no data or an error for one date, do not stop—continue checking the remaining dates and mention the missing data in your answer. "
-                "Once you have all required information, stop calling tools and answer concisely in the user's language."
-            ),
-        },
+        {"role": "system", "content": get_system_prompt()},
         {"role": "user", "content": prompt},
     ]
 
@@ -147,7 +99,6 @@ def main():
         while step < MAX_STEPS:
             step += 1
 
-            # One step = one model call
             t0_llm = time.perf_counter()
             response = client.chat.completions.create(
                 model=MODEL,
@@ -200,23 +151,12 @@ def main():
                         args=fn_args,
                     )
 
-                    # Execute tool (errors here are caught and returned to the model)
                     t0_tool = time.perf_counter()
                     if not args_valid:
                         tool_output = json.dumps({"error": parse_error})
                         tool_ok = False
-                    elif fn_name not in TOOL_REGISTRY:
-                        tool_output = json.dumps({"error": f"Unknown tool '{fn_name}'."})
-                        tool_ok = False
                     else:
-                        try:
-                            tool_output, tool_ok = TOOL_REGISTRY[fn_name](**fn_args)
-                        except TypeError as e:
-                            tool_output = json.dumps({"error": f"Argument mismatch for '{fn_name}': {str(e)}"})
-                            tool_ok = False
-                        except Exception as e:
-                            tool_output = json.dumps({"error": f"Tool execution error: {str(e)}"})
-                            tool_ok = False
+                        tool_output, tool_ok = execute_tool(fn_name, fn_args, DATA_BASE_URL)
 
                     tool_duration = (time.perf_counter() - t0_tool) * 1000
 
